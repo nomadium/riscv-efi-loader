@@ -5,86 +5,41 @@
  * exits boot services, and jumps to the kernel entry point.
  *
  * The kernel is expected at \kernel.bin on the ESP.
- * It will be loaded at the address specified by KERNEL_LOAD_ADDR.
  *
  * Kernel entry convention (compatible with Linux RISC-V boot protocol):
  *   a0 = hart id (current CPU)
  *   a1 = pointer to device tree blob (FDT)
  */
 
-#include "efi.h"
+#include <efi.h>
+#include <efilib.h>
 
 /* Configuration */
 #define KERNEL_PATH        L"\\kernel.bin"
-#define KERNEL_LOAD_ADDR   0x80000000ULL  /* Load address for the kernel (must match kernel's link.ld) */
-#define MAX_MEMORY_MAP     16384          /* Max size for memory map */
+#define KERNEL_LOAD_ADDR   0x80200000ULL  /* Standard RISC-V Linux kernel load address */
+#define MAX_MEMORY_MAP     16384
 
-/* Global EFI pointers (set by crt0.S) */
-extern EFI_HANDLE _image_handle;
-extern EFI_SYSTEM_TABLE *_system_table;
+/* Device Tree Table GUID */
+static EFI_GUID DtbTableGuid = {
+    0xb1b621d5, 0xf19c, 0x41a5,
+    {0x83, 0x0b, 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0}
+};
 
-/* Shorthand macros */
-#define ST _system_table
-#define BS _system_table->BootServices
+/* RISC-V Boot Protocol GUID */
+static EFI_GUID RiscvBootProtocolGuid = {
+    0xccd15aa8, 0x5e42, 0x4c68,
+    {0x88, 0x36, 0x24, 0x1c, 0x1d, 0x1c, 0x17, 0x9a}
+};
 
-/* Protocol GUIDs */
-static EFI_GUID LoadedImageProtocolGuid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
-static EFI_GUID SimpleFileSystemProtocolGuid = EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID;
-static EFI_GUID FileInfoGuid = EFI_FILE_INFO_GUID;
-static EFI_GUID DtbTableGuid = EFI_DTB_TABLE_GUID;
-static EFI_GUID RiscvBootProtocolGuid = RISCV_EFI_BOOT_PROTOCOL_GUID;
-
-/*
- * Print a string to the console
- */
-static void Print(CHAR16 *str)
-{
-    if (ST && ST->ConOut) {
-        ST->ConOut->OutputString(ST->ConOut, str);
-    }
-}
-
-/*
- * Print a string followed by a status code
- */
-static void PrintStatus(CHAR16 *str, EFI_STATUS status)
-{
-    Print(str);
-    if (EFI_ERROR(status)) {
-        Print(L" [FAILED]\r\n");
-    } else {
-        Print(L" [OK]\r\n");
-    }
-}
-
-/*
- * Print a 64-bit hex value
- */
-static void PrintHex64(CHAR16 *prefix, UINT64 value)
-{
-    static CHAR16 hex[] = L"0123456789ABCDEF";
-    CHAR16 buf[32];
-    int i;
-
-    Print(prefix);
-
-    buf[0] = L'0';
-    buf[1] = L'x';
-    for (i = 0; i < 16; i++) {
-        buf[2 + i] = hex[(value >> (60 - i * 4)) & 0xF];
-    }
-    buf[18] = L'\r';
-    buf[19] = L'\n';
-    buf[20] = L'\0';
-    Print(buf);
-}
-
-
+typedef struct {
+    UINT64 Revision;
+    EFI_STATUS (EFIAPI *GetBootHartId)(VOID *This, UINTN *BootHartId);
+} RISCV_EFI_BOOT_PROTOCOL;
 
 /*
  * Find the Device Tree Blob in EFI configuration tables
  */
-static VOID *FindDtb(void)
+static VOID *FindDtb(EFI_SYSTEM_TABLE *ST)
 {
     UINTN i;
 
@@ -98,15 +53,14 @@ static VOID *FindDtb(void)
 
 /*
  * Get the boot hart ID via RISC-V EFI boot protocol
- * Returns 0 if protocol not available (will use hart 0)
  */
-static UINTN GetBootHartId(void)
+static UINTN GetBootHartId(EFI_SYSTEM_TABLE *ST)
 {
     EFI_STATUS status;
     RISCV_EFI_BOOT_PROTOCOL *riscv_boot;
     UINTN hart_id = 0;
 
-    status = BS->LocateProtocol(&RiscvBootProtocolGuid, NULL, (VOID **)&riscv_boot);
+    status = LibLocateProtocol(&RiscvBootProtocolGuid, (VOID **)&riscv_boot);
     if (!EFI_ERROR(status) && riscv_boot && riscv_boot->GetBootHartId) {
         riscv_boot->GetBootHartId(riscv_boot, &hart_id);
     }
@@ -115,197 +69,177 @@ static UINTN GetBootHartId(void)
 
 /*
  * Kernel entry point type
- *
- * a0 = hart id
- * a1 = device tree pointer
  */
-typedef void (*kernel_entry_t)(UINTN hart_id, VOID *dtb);
+typedef VOID (*kernel_entry_t)(UINTN hart_id, VOID *dtb);
 
 /*
  * EFI application entry point
  */
 EFI_STATUS
-EFIAPI
-efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable __attribute__((unused)))
+efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
 {
     EFI_STATUS status;
-    EFI_LOADED_IMAGE_PROTOCOL *loaded_image;
-    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs;
-    EFI_FILE_PROTOCOL *root, *file;
-    EFI_FILE_INFO *file_info;
-    UINT8 file_info_buf[256];
-    UINTN file_info_size;
-    UINTN kernel_size;
-    EFI_PHYSICAL_ADDRESS kernel_addr;
-    UINTN pages;
-    VOID *dtb;
-    UINTN hart_id;
+    EFI_LOADED_IMAGE *LoadedImage;
+    EFI_FILE_IO_INTERFACE *Volume;
+    EFI_FILE_HANDLE RootDir, KernelFile;
+    EFI_FILE_INFO *FileInfo;
+    UINTN FileInfoSize;
+    UINT8 FileInfoBuffer[512];
+    UINTN KernelSize;
+    EFI_PHYSICAL_ADDRESS KernelAddr;
+    UINTN Pages;
+    VOID *Dtb;
+    UINTN HartId;
     
     /* Memory map variables */
-    UINT8 memory_map[MAX_MEMORY_MAP];
-    UINTN map_size, map_key, desc_size;
-    UINT32 desc_version;
+    UINT8 MemoryMapBuffer[MAX_MEMORY_MAP];
+    UINTN MemoryMapSize, MapKey, DescriptorSize;
+    UINT32 DescriptorVersion;
     
-    kernel_entry_t kernel_entry;
+    kernel_entry_t KernelEntry;
+
+    /* Initialize gnu-efi library */
+    InitializeLib(ImageHandle, SystemTable);
 
     /* Clear screen and print banner */
-    if (ST->ConOut) {
-        ST->ConOut->ClearScreen(ST->ConOut);
-    }
+    ST->ConOut->ClearScreen(ST->ConOut);
     Print(L"\r\n");
     Print(L"========================================\r\n");
     Print(L"  RISC-V EFI Bootloader\r\n");
     Print(L"========================================\r\n\r\n");
 
-    /* Get loaded image protocol to find our device */
-    Print(L"Getting loaded image protocol...");
-    status = BS->HandleProtocol(ImageHandle, &LoadedImageProtocolGuid,
-                                (VOID **)&loaded_image);
+    /* Get loaded image protocol */
+    Print(L"Getting loaded image protocol... ");
+    status = BS->HandleProtocol(ImageHandle, &gEfiLoadedImageProtocolGuid,
+                                (VOID **)&LoadedImage);
     if (EFI_ERROR(status)) {
-        PrintStatus(L"", status);
+        Print(L"FAILED: %r\r\n", status);
         goto halt;
     }
-    PrintStatus(L"", status);
+    Print(L"OK\r\n");
 
-    /* Get file system protocol from our device */
-    Print(L"Getting file system protocol...");
-    status = BS->HandleProtocol(loaded_image->DeviceHandle,
-                                &SimpleFileSystemProtocolGuid,
-                                (VOID **)&fs);
+    /* Get file system protocol */
+    Print(L"Getting file system protocol... ");
+    status = BS->HandleProtocol(LoadedImage->DeviceHandle,
+                                &gEfiSimpleFileSystemProtocolGuid,
+                                (VOID **)&Volume);
     if (EFI_ERROR(status)) {
-        PrintStatus(L"", status);
+        Print(L"FAILED: %r\r\n", status);
         goto halt;
     }
-    PrintStatus(L"", status);
+    Print(L"OK\r\n");
 
-    /* Open the root directory */
-    Print(L"Opening root directory...");
-    status = fs->OpenVolume(fs, &root);
+    /* Open root directory */
+    Print(L"Opening root directory... ");
+    status = Volume->OpenVolume(Volume, &RootDir);
     if (EFI_ERROR(status)) {
-        PrintStatus(L"", status);
+        Print(L"FAILED: %r\r\n", status);
         goto halt;
     }
-    PrintStatus(L"", status);
+    Print(L"OK\r\n");
 
-    /* Open the kernel file */
-    Print(L"Opening kernel file: ");
-    Print(KERNEL_PATH);
-    Print(L"...");
-    status = root->Open(root, &file, KERNEL_PATH, EFI_FILE_MODE_READ, 0);
+    /* Open kernel file */
+    Print(L"Opening kernel file %s... ", KERNEL_PATH);
+    status = RootDir->Open(RootDir, &KernelFile, KERNEL_PATH,
+                           EFI_FILE_MODE_READ, 0);
     if (EFI_ERROR(status)) {
-        PrintStatus(L"", status);
-        Print(L"\r\nERROR: Kernel file not found!\r\n");
-        Print(L"Please place your kernel at ");
-        Print(KERNEL_PATH);
-        Print(L" on the EFI System Partition.\r\n");
+        Print(L"FAILED: %r\r\n", status);
+        Print(L"\r\nPlease place kernel at %s on the ESP.\r\n", KERNEL_PATH);
         goto halt;
     }
-    PrintStatus(L"", status);
+    Print(L"OK\r\n");
 
-    /* Get kernel file size */
-    Print(L"Getting kernel file info...");
-    file_info_size = sizeof(file_info_buf);
-    status = file->GetInfo(file, &FileInfoGuid, &file_info_size, file_info_buf);
+    /* Get kernel file info */
+    Print(L"Getting kernel file info... ");
+    FileInfoSize = sizeof(FileInfoBuffer);
+    status = KernelFile->GetInfo(KernelFile, &gEfiFileInfoGuid,
+                                  &FileInfoSize, FileInfoBuffer);
     if (EFI_ERROR(status)) {
-        PrintStatus(L"", status);
+        Print(L"FAILED: %r\r\n", status);
         goto halt;
     }
-    file_info = (EFI_FILE_INFO *)file_info_buf;
-    kernel_size = file_info->FileSize;
-    PrintStatus(L"", status);
-    PrintHex64(L"  Kernel size: ", kernel_size);
+    FileInfo = (EFI_FILE_INFO *)FileInfoBuffer;
+    KernelSize = FileInfo->FileSize;
+    Print(L"OK (%d bytes)\r\n", KernelSize);
 
-    /* Allocate memory for kernel at the load address */
-    Print(L"Allocating memory for kernel...");
-    kernel_addr = KERNEL_LOAD_ADDR;
-    pages = EFI_SIZE_TO_PAGES(kernel_size);
-    status = BS->AllocatePages(AllocateAddress, EfiLoaderData, pages, &kernel_addr);
+    /* Allocate memory for kernel */
+    Print(L"Allocating memory at 0x%lx... ", KERNEL_LOAD_ADDR);
+    KernelAddr = KERNEL_LOAD_ADDR;
+    Pages = EFI_SIZE_TO_PAGES(KernelSize);
+    status = BS->AllocatePages(AllocateAddress, EfiLoaderCode, Pages, &KernelAddr);
     if (EFI_ERROR(status)) {
-        /* Try allocating anywhere if specific address fails */
-        Print(L" (trying any address)...");
-        status = BS->AllocatePages(AllocateAnyPages, EfiLoaderData, pages, &kernel_addr);
+        Print(L"(trying any address) ");
+        status = BS->AllocatePages(AllocateAnyPages, EfiLoaderCode, Pages, &KernelAddr);
         if (EFI_ERROR(status)) {
-            PrintStatus(L"", status);
+            Print(L"FAILED: %r\r\n", status);
             goto halt;
         }
     }
-    PrintStatus(L"", status);
-    PrintHex64(L"  Load address: ", kernel_addr);
+    Print(L"OK at 0x%lx\r\n", KernelAddr);
 
-    /* Read kernel into memory */
-    Print(L"Loading kernel into memory...");
-    status = file->Read(file, &kernel_size, (VOID *)kernel_addr);
+    /* Load kernel into memory */
+    Print(L"Loading kernel into memory... ");
+    status = KernelFile->Read(KernelFile, &KernelSize, (VOID *)KernelAddr);
     if (EFI_ERROR(status)) {
-        PrintStatus(L"", status);
+        Print(L"FAILED: %r\r\n", status);
         goto halt;
     }
-    PrintStatus(L"", status);
+    Print(L"OK\r\n");
 
     /* Close file handles */
-    file->Close(file);
-    root->Close(root);
+    KernelFile->Close(KernelFile);
+    RootDir->Close(RootDir);
 
-    /* Find device tree blob */
-    Print(L"Looking for device tree blob...");
-    dtb = FindDtb();
-    if (dtb) {
-        PrintStatus(L"", EFI_SUCCESS);
-        PrintHex64(L"  DTB address: ", (UINT64)dtb);
+    /* Find device tree */
+    Print(L"Looking for device tree... ");
+    Dtb = FindDtb(ST);
+    if (Dtb) {
+        Print(L"OK at 0x%lx\r\n", (UINT64)Dtb);
     } else {
-        Print(L" [NOT FOUND - kernel may fail]\r\n");
+        Print(L"NOT FOUND\r\n");
     }
 
     /* Get boot hart ID */
-    Print(L"Getting boot hart ID...");
-    hart_id = GetBootHartId();
-    PrintStatus(L"", EFI_SUCCESS);
-    PrintHex64(L"  Hart ID: ", hart_id);
+    Print(L"Getting boot hart ID... ");
+    HartId = GetBootHartId(ST);
+    Print(L"OK (hart %d)\r\n", HartId);
 
-    /* Prepare to exit boot services */
+    /* Get memory map for ExitBootServices */
     Print(L"\r\nPreparing to exit boot services...\r\n");
-
-    /* Get memory map (required for ExitBootServices) */
-    map_size = sizeof(memory_map);
-    status = BS->GetMemoryMap(&map_size, (EFI_MEMORY_DESCRIPTOR *)memory_map,
-                              &map_key, &desc_size, &desc_version);
+    MemoryMapSize = sizeof(MemoryMapBuffer);
+    status = BS->GetMemoryMap(&MemoryMapSize, (EFI_MEMORY_DESCRIPTOR *)MemoryMapBuffer,
+                              &MapKey, &DescriptorSize, &DescriptorVersion);
     if (EFI_ERROR(status)) {
-        Print(L"Failed to get memory map!\r\n");
+        Print(L"Failed to get memory map: %r\r\n", status);
         goto halt;
     }
 
-    /* Exit boot services - point of no return */
+    /* Exit boot services */
     Print(L"Exiting boot services...\r\n");
-    status = BS->ExitBootServices(ImageHandle, map_key);
+    status = BS->ExitBootServices(ImageHandle, MapKey);
     if (EFI_ERROR(status)) {
-        /* Memory map may have changed, try again */
-        map_size = sizeof(memory_map);
-        status = BS->GetMemoryMap(&map_size, (EFI_MEMORY_DESCRIPTOR *)memory_map,
-                                  &map_key, &desc_size, &desc_version);
-        if (!EFI_ERROR(status)) {
-            status = BS->ExitBootServices(ImageHandle, map_key);
-        }
+        /* Memory map may have changed, try once more */
+        MemoryMapSize = sizeof(MemoryMapBuffer);
+        BS->GetMemoryMap(&MemoryMapSize, (EFI_MEMORY_DESCRIPTOR *)MemoryMapBuffer,
+                         &MapKey, &DescriptorSize, &DescriptorVersion);
+        status = BS->ExitBootServices(ImageHandle, MapKey);
     }
 
     if (EFI_ERROR(status)) {
-        /* We can't print anymore after failed ExitBootServices attempt */
-        goto halt;
+        /* Can't print after failed ExitBootServices */
+        while (1) {
+            __asm__ volatile("wfi");
+        }
     }
 
     /*
      * Boot services are now terminated!
-     * - No more EFI console output
-     * - No more memory allocation
-     * - Only runtime services available
+     * Jump to kernel with:
+     *   a0 = hart id
+     *   a1 = device tree pointer
      */
-
-    /* Set up kernel entry point */
-    kernel_entry = (kernel_entry_t)kernel_addr;
-
-    /* Jump to kernel!
-     * a0 = hart id
-     * a1 = device tree pointer
-     */
-    kernel_entry(hart_id, dtb);
+    KernelEntry = (kernel_entry_t)KernelAddr;
+    KernelEntry(HartId, Dtb);
 
     /* Should never reach here */
     while (1) {
@@ -313,20 +247,7 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable __attribute__((un
     }
 
 halt:
-    Print(L"\r\nBoot failed. System halted.\r\n");
-    Print(L"Press any key to continue...\r\n");
-    
-    /* Wait for keypress */
-    {
-        UINTN index;
-        EFI_INPUT_KEY key;
-        BS->WaitForEvent(1, &ST->ConIn->WaitForKey, &index);
-        ST->ConIn->ReadKeyStroke(ST->ConIn, &key);
-    }
-    
-    while (1) {
-        __asm__ volatile("wfi");
-    }
-    
+    Print(L"\r\nBoot failed. Press any key...\r\n");
+    WaitForSingleEvent(ST->ConIn->WaitForKey, 0);
     return EFI_LOAD_ERROR;
 }
