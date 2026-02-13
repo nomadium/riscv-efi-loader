@@ -66,9 +66,11 @@ static UINT32 GetDtbSize(VOID *Dtb)
 static VOID *FindDtb(EFI_SYSTEM_TABLE *ST)
 {
     UINTN i;
-
+    
     for (i = 0; i < ST->NumberOfTableEntries; i++) {
-        if (CompareGuid(&ST->ConfigurationTable[i].VendorGuid, &DtbTableGuid)) {
+        EFI_GUID *g = &ST->ConfigurationTable[i].VendorGuid;
+        /* Note: gnu-efi 3.0 CompareGuid returns 0 when GUIDs are EQUAL */
+        if (CompareGuid(g, &DtbTableGuid) == 0) {
             return ST->ConfigurationTable[i].VendorTable;
         }
     }
