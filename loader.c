@@ -17,7 +17,9 @@
 /* Configuration */
 #define KERNEL_PATH        L"\\kernel.bin"
 #define KERNEL_LOAD_ADDR   0x80200000ULL  /* Standard RISC-V Linux kernel load address */
+#define DTB_LOAD_ADDR      0x82200000ULL  /* DTB location (matches OpenSBI convention) */
 #define MAX_MEMORY_MAP     16384
+#define FDT_MAGIC          0xd00dfeed
 
 /* Device Tree Table GUID */
 static EFI_GUID DtbTableGuid = {
@@ -35,6 +37,28 @@ typedef struct {
     UINT64 Revision;
     EFI_STATUS (EFIAPI *GetBootHartId)(VOID *This, UINTN *BootHartId);
 } RISCV_EFI_BOOT_PROTOCOL;
+
+/*
+ * Convert big-endian u32 to native
+ */
+static UINT32 fdt32_to_cpu(UINT32 x)
+{
+    return ((x & 0xff000000) >> 24) |
+           ((x & 0x00ff0000) >> 8)  |
+           ((x & 0x0000ff00) << 8)  |
+           ((x & 0x000000ff) << 24);
+}
+
+/*
+ * Get DTB size from header
+ */
+static UINT32 GetDtbSize(VOID *Dtb)
+{
+    UINT32 *hdr = (UINT32 *)Dtb;
+    if (fdt32_to_cpu(hdr[0]) != FDT_MAGIC)
+        return 0;
+    return fdt32_to_cpu(hdr[1]);  /* totalsize field */
+}
 
 /*
  * Find the Device Tree Blob in EFI configuration tables
@@ -101,8 +125,7 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     /* Initialize gnu-efi library */
     InitializeLib(ImageHandle, SystemTable);
 
-    /* Clear screen and print banner */
-    ST->ConOut->ClearScreen(ST->ConOut);
+    /* Print banner */
     Print(L"\r\n");
     Print(L"========================================\r\n");
     Print(L"  RISC-V EFI Bootloader\r\n");
@@ -190,14 +213,34 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     KernelFile->Close(KernelFile);
     RootDir->Close(RootDir);
 
-    /* Find device tree */
+    /* Find device tree - try EFI config table first, fall back to OpenSBI location */
     Print(L"Looking for device tree... ");
-    Dtb = FindDtb(ST);
-    if (Dtb) {
-        Print(L"OK at 0x%lx\r\n", (UINT64)Dtb);
-    } else {
-        Print(L"NOT FOUND\r\n");
+    VOID *OrigDtb = FindDtb(ST);
+    UINT32 DtbSize = 0;
+    
+    if (OrigDtb) {
+        DtbSize = GetDtbSize(OrigDtb);
+        if (DtbSize > 0) {
+            Print(L"EFI config table at 0x%lx (%d bytes)\r\n", (UINT64)OrigDtb, DtbSize);
+        } else {
+            OrigDtb = NULL;  /* Invalid, try fallback */
+        }
     }
+    
+    /* Fall back to OpenSBI's DTB location */
+    if (!OrigDtb || DtbSize == 0) {
+        OrigDtb = (VOID *)DTB_LOAD_ADDR;
+        DtbSize = GetDtbSize(OrigDtb);
+        if (DtbSize > 0) {
+            Print(L"OpenSBI location at 0x%lx (%d bytes)\r\n", (UINT64)OrigDtb, DtbSize);
+        } else {
+            Print(L"NOT FOUND\r\n");
+            OrigDtb = NULL;
+        }
+    }
+    
+    /* Use the DTB in place (it's already in a good location) */
+    Dtb = OrigDtb;
 
     /* Get boot hart ID */
     Print(L"Getting boot hart ID... ");
