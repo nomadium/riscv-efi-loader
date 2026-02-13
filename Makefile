@@ -1,76 +1,73 @@
-# RISC-V 64-bit EFI Bootloader Makefile (using gnu-efi)
+# x86_64 EFI Bootloader Makefile (using gnu-efi)
 
-ARCH = riscv64
-CROSS_COMPILE ?= riscv64-linux-gnu-
-CC      = $(CROSS_COMPILE)gcc
-LD      = $(CROSS_COMPILE)ld
-OBJCOPY = $(CROSS_COMPILE)objcopy
+ARCH = x86_64
 
-# gnu-efi paths (extracted from Ubuntu riscv64 package)
-GNUEFI_DIR   = gnu-efi
-INCLUDE_DIRS = -I$(GNUEFI_DIR)/include -I$(GNUEFI_DIR)/include/$(ARCH)
-LDSCRIPT     = $(GNUEFI_DIR)/elf_$(ARCH)_efi.lds
-CRT_EFI      = $(GNUEFI_DIR)/crt0-efi-$(ARCH).o
-LIBEFI       = $(GNUEFI_DIR)/libefi.a
-LIBGNUEFI    = $(GNUEFI_DIR)/libgnuefi.a
+CC      = gcc
+LD      = ld
+OBJCOPY = objcopy
+
+# gnu-efi paths (from Ubuntu package)
+GNUEFI_INC   = /usr/include/efi
+GNUEFI_LIB   = /usr/lib
+LDSCRIPT     = $(GNUEFI_LIB)/elf_$(ARCH)_efi.lds
+CRT_EFI      = $(GNUEFI_LIB)/crt0-efi-$(ARCH).o
+LIBEFI       = $(GNUEFI_LIB)/libefi.a
+LIBGNUEFI    = $(GNUEFI_LIB)/libgnuefi.a
 
 # Compiler flags
-CFLAGS  = $(INCLUDE_DIRS)
+CFLAGS  = -I$(GNUEFI_INC) -I$(GNUEFI_INC)/$(ARCH)
+CFLAGS += -DHAVE_USE_MS_ABI
 CFLAGS += -ffreestanding
 CFLAGS += -fno-stack-protector -fno-stack-check
 CFLAGS += -fshort-wchar
-CFLAGS += -fPIC
+CFLAGS += -fPIC -fno-plt
 CFLAGS += -fno-builtin
-CFLAGS += -mno-relax
-CFLAGS += -march=rv64gc -mabi=lp64d -mcmodel=medany
-CFLAGS += -Wall -Wextra -O2
+CFLAGS += -mno-red-zone -maccumulate-outgoing-args
+CFLAGS += -Wall -O2
 
 # Linker flags
 LDFLAGS  = -nostdlib
 LDFLAGS += -shared -Bsymbolic
 LDFLAGS += -T $(LDSCRIPT)
-LDFLAGS += --no-relax
 
-# QEMU settings
-QEMU = qemu-system-riscv64
-OVMF_CODE = /usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd
-OVMF_VARS = /usr/share/qemu-efi-riscv64/RISCV_VIRT_VARS.fd
+# Target
+TARGET = loader.efi
 
-all: loader.efi
+all: $(TARGET)
 
-# Convert ELF shared object to PE/COFF binary
-# The -O binary preserves the PE header from crt0's .text.head section
-loader.efi: loader.so
-	$(OBJCOPY) -O binary $< $@
-	@echo "Built $@ ($$(stat -c%s $@) bytes)"
+loader.o: loader.c
+	$(CC) $(CFLAGS) -c -o $@ $<
 
-# Link EFI shared object
 loader.so: loader.o
 	$(LD) $(LDFLAGS) $(CRT_EFI) $< $(LIBGNUEFI) $(LIBEFI) -o $@
 
-loader.o: loader.c
-	$(CC) $(CFLAGS) -c $< -o $@
+$(TARGET): loader.so
+	$(OBJCOPY) -j .text -j .sdata -j .data -j .rodata \
+		-j .dynamic -j .dynsym -j .rel -j .rela -j .reloc \
+		--target efi-app-$(ARCH) --subsystem=10 $< $@
+	@echo "Built $(TARGET) ($$(stat -c%s $(TARGET)) bytes)"
 
 # Create ESP image directory
-image: loader.efi
+image: $(TARGET)
 	mkdir -p image/EFI/BOOT
-	cp loader.efi image/EFI/BOOT/BOOTRISCV64.EFI
-	@echo "Place your kernel.bin in image/ directory"
+	cp $(TARGET) image/EFI/BOOT/BOOTX64.EFI
+	@echo "ESP image created in image/"
 
-# Create OVMF vars copy
-ovmf_vars.fd:
-	cp $(OVMF_VARS) $@
+# QEMU with OVMF
+OVMF_CODE = /usr/share/OVMF/OVMF_CODE_4M.fd
+OVMF_VARS = /usr/share/OVMF/OVMF_VARS_4M.fd
 
-# Run in QEMU
-qemu: image ovmf_vars.fd
-	@if [ ! -f image/kernel.bin ]; then \
-		echo "WARNING: image/kernel.bin not found!"; \
-	fi
-	$(QEMU) -M virt -m 256M -smp 2 -nographic \
-		-drive if=pflash,format=raw,unit=0,file=$(OVMF_CODE),readonly=on \
-		-drive if=pflash,format=raw,unit=1,file=ovmf_vars.fd \
-		-drive file=fat:rw:image,format=raw,id=hd0 \
-		-device virtio-blk-device,drive=hd0
+qemu: image
+	cp $(OVMF_VARS) ovmf_vars.fd
+	qemu-system-x86_64 \
+		-machine q35 \
+		-m 256M \
+		-smp 4 \
+		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+		-drive if=pflash,format=raw,file=ovmf_vars.fd \
+		-drive format=raw,file=fat:rw:image \
+		-nographic \
+		-no-reboot
 
 clean:
 	rm -f *.o *.so *.efi ovmf_vars.fd

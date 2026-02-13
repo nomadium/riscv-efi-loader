@@ -1,298 +1,346 @@
 /*
- * RISC-V EFI Bootloader
+ * x86_64 EFI Bootloader
  *
  * Loads a raw binary kernel from the EFI System Partition,
  * exits boot services, and jumps to the kernel entry point.
  *
  * The kernel is expected at \kernel.bin on the ESP.
  *
- * Kernel entry convention (compatible with Linux RISC-V boot protocol):
- *   a0 = hart id (current CPU)
- *   a1 = pointer to device tree blob (FDT)
+ * Kernel entry convention:
+ *   RDI = pointer to boot info structure
+ *
+ * Note: efi_main uses System V ABI because gnu-efi's crt0 converts
+ * from MS ABI (UEFI) to System V ABI before calling efi_main.
  */
 
 #include <efi.h>
-#include <efilib.h>
 
 /* Configuration */
 #define KERNEL_PATH        L"\\kernel.bin"
-#define KERNEL_LOAD_ADDR   0x80200000ULL  /* Standard RISC-V Linux kernel load address */
-#define DTB_LOAD_ADDR      0x82200000ULL  /* DTB location (matches OpenSBI convention) */
+#define KERNEL_LOAD_ADDR   0x100000ULL  /* 1MB - traditional x86 kernel load address */
 #define MAX_MEMORY_MAP     16384
-#define FDT_MAGIC          0xd00dfeed
 
-/* Device Tree Table GUID */
-static EFI_GUID DtbTableGuid = {
-    0xb1b621d5, 0xf19c, 0x41a5,
-    {0x83, 0x0b, 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0}
+/* Boot info passed to kernel */
+struct boot_info {
+    UINT64 magic;             /* 0x424F4F54494E464F "BOOTINFO" */
+    UINT64 mem_map_addr;      /* Physical address of memory map */
+    UINT64 mem_map_size;      /* Size of memory map in bytes */
+    UINT64 mem_map_desc_size; /* Size of each descriptor */
+    UINT64 framebuffer_addr;  /* Framebuffer address (0 if none) */
+    UINT64 framebuffer_width;
+    UINT64 framebuffer_height;
+    UINT64 framebuffer_pitch;
+    UINT64 acpi_rsdp;         /* ACPI RSDP address */
+    UINT64 num_cpus;          /* Number of CPUs (from ACPI MADT) */
 };
 
-/* RISC-V Boot Protocol GUID */
-static EFI_GUID RiscvBootProtocolGuid = {
-    0xccd15aa8, 0x5e42, 0x4c68,
-    {0x88, 0x36, 0x24, 0x1c, 0x1d, 0x1c, 0x17, 0x9a}
-};
+#define BOOT_INFO_MAGIC 0x424F4F54494E464FULL
 
-typedef struct {
-    UINT64 Revision;
-    EFI_STATUS (EFIAPI *GetBootHartId)(VOID *This, UINTN *BootHartId);
-} RISCV_EFI_BOOT_PROTOCOL;
+/* Serial port output for debugging */
+#define COM1 0x3F8
 
-/*
- * Convert big-endian u32 to native
- */
-static UINT32 fdt32_to_cpu(UINT32 x)
-{
-    return ((x & 0xff000000) >> 24) |
-           ((x & 0x00ff0000) >> 8)  |
-           ((x & 0x0000ff00) << 8)  |
-           ((x & 0x000000ff) << 24);
+static inline void outb(UINT16 port, UINT8 val) {
+    __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
 }
 
-/*
- * Get DTB size from header
- */
-static UINT32 GetDtbSize(VOID *Dtb)
-{
-    UINT32 *hdr = (UINT32 *)Dtb;
-    if (fdt32_to_cpu(hdr[0]) != FDT_MAGIC)
-        return 0;
-    return fdt32_to_cpu(hdr[1]);  /* totalsize field */
+static inline UINT8 inb(UINT16 port) {
+    UINT8 ret;
+    __asm__ volatile("inb %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
 }
 
+static void serial_init(void) {
+    outb(COM1 + 1, 0x00);  /* Disable interrupts */
+    outb(COM1 + 3, 0x80);  /* Enable DLAB */
+    outb(COM1 + 0, 0x01);  /* Divisor low (115200 baud) */
+    outb(COM1 + 1, 0x00);  /* Divisor high */
+    outb(COM1 + 3, 0x03);  /* 8N1 */
+    outb(COM1 + 2, 0xC7);  /* FIFO */
+    outb(COM1 + 4, 0x0B);  /* RTS/DSR set */
+}
+
+static void serial_putc(char c) {
+    while ((inb(COM1 + 5) & 0x20) == 0);
+    outb(COM1, c);
+}
+
+static void serial_puts(const char *s) {
+    while (*s) {
+        if (*s == '\n') serial_putc('\r');
+        serial_putc(*s++);
+    }
+}
+
+static void serial_puthex(UINT64 n) {
+    const char *hex = "0123456789abcdef";
+    serial_puts("0x");
+    for (int i = 60; i >= 0; i -= 4) {
+        serial_putc(hex[(n >> i) & 0xf]);
+    }
+}
+
+static void serial_putint(UINT64 n) {
+    char buf[21];
+    int i = 0;
+    if (n == 0) {
+        serial_putc('0');
+        return;
+    }
+    while (n > 0) {
+        buf[i++] = '0' + (n % 10);
+        n /= 10;
+    }
+    while (i > 0) {
+        serial_putc(buf[--i]);
+    }
+}
+
+/* ACPI GUIDs */
+static EFI_GUID Acpi20TableGuid = { 0x8868e871, 0xe4f1, 0x11d3, {0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81} };
+static EFI_GUID Acpi10TableGuid = { 0xeb9d2d30, 0x2d88, 0x11d3, {0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d} };
+
+/* Protocol GUIDs we need */
+static EFI_GUID LoadedImageProtocol = { 0x5B1B31A1, 0x9562, 0x11d2, {0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B} };
+static EFI_GUID SimpleFileSystemProtocol = { 0x0964e5b22, 0x6459, 0x11d2, {0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b} };
+static EFI_GUID FileInfoGuid = { 0x09576e92, 0x6d3f, 0x11d2, {0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b} };
+
 /*
- * Find the Device Tree Blob in EFI configuration tables
+ * Find ACPI RSDP in EFI configuration tables
  */
-static VOID *FindDtb(EFI_SYSTEM_TABLE *ST)
+static VOID *FindAcpiRsdp(EFI_SYSTEM_TABLE *ST)
 {
     UINTN i;
     
+    /* Try ACPI 2.0 first */
     for (i = 0; i < ST->NumberOfTableEntries; i++) {
-        EFI_GUID *g = &ST->ConfigurationTable[i].VendorGuid;
-        /* Note: gnu-efi 3.0 CompareGuid returns 0 when GUIDs are EQUAL */
-        if (CompareGuid(g, &DtbTableGuid) == 0) {
-            return ST->ConfigurationTable[i].VendorTable;
+        EFI_CONFIGURATION_TABLE *entry = &ST->ConfigurationTable[i];
+        EFI_GUID *guid = &entry->VendorGuid;
+        
+        if (guid->Data1 == Acpi20TableGuid.Data1 &&
+            guid->Data2 == Acpi20TableGuid.Data2 &&
+            guid->Data3 == Acpi20TableGuid.Data3) {
+            return entry->VendorTable;
         }
     }
-    return NULL;
-}
-
-/*
- * Get the boot hart ID via RISC-V EFI boot protocol
- */
-static UINTN GetBootHartId(EFI_SYSTEM_TABLE *ST)
-{
-    EFI_STATUS status;
-    RISCV_EFI_BOOT_PROTOCOL *riscv_boot;
-    UINTN hart_id = 0;
-
-    status = LibLocateProtocol(&RiscvBootProtocolGuid, (VOID **)&riscv_boot);
-    if (!EFI_ERROR(status) && riscv_boot && riscv_boot->GetBootHartId) {
-        riscv_boot->GetBootHartId(riscv_boot, &hart_id);
+    
+    /* Fall back to ACPI 1.0 */
+    for (i = 0; i < ST->NumberOfTableEntries; i++) {
+        EFI_CONFIGURATION_TABLE *entry = &ST->ConfigurationTable[i];
+        EFI_GUID *guid = &entry->VendorGuid;
+        
+        if (guid->Data1 == Acpi10TableGuid.Data1 &&
+            guid->Data2 == Acpi10TableGuid.Data2 &&
+            guid->Data3 == Acpi10TableGuid.Data3) {
+            return entry->VendorTable;
+        }
     }
-    return hart_id;
+    
+    return 0;
 }
 
 /*
- * Kernel entry point type
+ * Kernel entry point type (System V ABI)
  */
-typedef VOID (*kernel_entry_t)(UINTN hart_id, VOID *dtb);
+typedef VOID (*kernel_entry_t)(struct boot_info *info);
 
 /*
  * EFI application entry point
+ * Note: Uses System V ABI because crt0 converts from MS ABI
  */
 EFI_STATUS
 efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
 {
     EFI_STATUS status;
+    EFI_BOOT_SERVICES *BS = SystemTable->BootServices;
     EFI_LOADED_IMAGE *LoadedImage;
-    EFI_FILE_IO_INTERFACE *Volume;
-    EFI_FILE_HANDLE RootDir, KernelFile;
+    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *Volume;
+    EFI_FILE_PROTOCOL *RootDir, *KernelFile;
     EFI_FILE_INFO *FileInfo;
     UINTN FileInfoSize;
     UINT8 FileInfoBuffer[512];
     UINTN KernelSize;
     EFI_PHYSICAL_ADDRESS KernelAddr;
     UINTN Pages;
-    VOID *Dtb;
-    UINTN HartId;
+    VOID *AcpiRsdp;
     
     /* Memory map variables */
-    UINT8 MemoryMapBuffer[MAX_MEMORY_MAP];
+    static UINT8 MemoryMapBuffer[MAX_MEMORY_MAP];
     UINTN MemoryMapSize, MapKey, DescriptorSize;
     UINT32 DescriptorVersion;
     
+    /* Boot info - static so it survives ExitBootServices */
+    static struct boot_info BootInfo;
+    
     kernel_entry_t KernelEntry;
 
-    /* Initialize gnu-efi library */
-    InitializeLib(ImageHandle, SystemTable);
+    /* Initialize serial for debug output */
+    serial_init();
 
     /* Print banner */
-    Print(L"\r\n");
-    Print(L"========================================\r\n");
-    Print(L"  RISC-V EFI Bootloader\r\n");
-    Print(L"========================================\r\n\r\n");
+    serial_puts("\n");
+    serial_puts("========================================\n");
+    serial_puts("  x86_64 EFI Bootloader\n");
+    serial_puts("========================================\n\n");
 
     /* Get loaded image protocol */
-    Print(L"Getting loaded image protocol... ");
-    status = BS->HandleProtocol(ImageHandle, &gEfiLoadedImageProtocolGuid,
+    serial_puts("Getting loaded image protocol... ");
+    status = BS->HandleProtocol(ImageHandle, &LoadedImageProtocol,
                                 (VOID **)&LoadedImage);
     if (EFI_ERROR(status)) {
-        Print(L"FAILED: %r\r\n", status);
+        serial_puts("FAILED\n");
         goto halt;
     }
-    Print(L"OK\r\n");
+    serial_puts("OK\n");
 
     /* Get file system protocol */
-    Print(L"Getting file system protocol... ");
+    serial_puts("Getting file system protocol... ");
     status = BS->HandleProtocol(LoadedImage->DeviceHandle,
-                                &gEfiSimpleFileSystemProtocolGuid,
+                                &SimpleFileSystemProtocol,
                                 (VOID **)&Volume);
     if (EFI_ERROR(status)) {
-        Print(L"FAILED: %r\r\n", status);
+        serial_puts("FAILED\n");
         goto halt;
     }
-    Print(L"OK\r\n");
+    serial_puts("OK\n");
 
     /* Open root directory */
-    Print(L"Opening root directory... ");
+    serial_puts("Opening root directory... ");
     status = Volume->OpenVolume(Volume, &RootDir);
     if (EFI_ERROR(status)) {
-        Print(L"FAILED: %r\r\n", status);
+        serial_puts("FAILED\n");
         goto halt;
     }
-    Print(L"OK\r\n");
+    serial_puts("OK\n");
 
     /* Open kernel file */
-    Print(L"Opening kernel file %s... ", KERNEL_PATH);
+    serial_puts("Opening kernel file... ");
     status = RootDir->Open(RootDir, &KernelFile, KERNEL_PATH,
                            EFI_FILE_MODE_READ, 0);
     if (EFI_ERROR(status)) {
-        Print(L"FAILED: %r\r\n", status);
-        Print(L"\r\nPlease place kernel at %s on the ESP.\r\n", KERNEL_PATH);
+        serial_puts("FAILED - kernel.bin not found\n");
         goto halt;
     }
-    Print(L"OK\r\n");
+    serial_puts("OK\n");
 
     /* Get kernel file info */
-    Print(L"Getting kernel file info... ");
+    serial_puts("Getting kernel file info... ");
     FileInfoSize = sizeof(FileInfoBuffer);
-    status = KernelFile->GetInfo(KernelFile, &gEfiFileInfoGuid,
+    status = KernelFile->GetInfo(KernelFile, &FileInfoGuid,
                                   &FileInfoSize, FileInfoBuffer);
     if (EFI_ERROR(status)) {
-        Print(L"FAILED: %r\r\n", status);
+        serial_puts("FAILED\n");
         goto halt;
     }
     FileInfo = (EFI_FILE_INFO *)FileInfoBuffer;
     KernelSize = FileInfo->FileSize;
-    Print(L"OK (%d bytes)\r\n", KernelSize);
+    serial_puts("OK (");
+    serial_putint(KernelSize);
+    serial_puts(" bytes)\n");
 
     /* Allocate memory for kernel */
-    Print(L"Allocating memory at 0x%lx... ", KERNEL_LOAD_ADDR);
+    serial_puts("Allocating memory at ");
+    serial_puthex(KERNEL_LOAD_ADDR);
+    serial_puts("... ");
     KernelAddr = KERNEL_LOAD_ADDR;
-    Pages = EFI_SIZE_TO_PAGES(KernelSize);
+    Pages = (KernelSize + 4095) / 4096;
     status = BS->AllocatePages(AllocateAddress, EfiLoaderCode, Pages, &KernelAddr);
     if (EFI_ERROR(status)) {
-        Print(L"(trying any address) ");
+        serial_puts("(trying any address) ");
         status = BS->AllocatePages(AllocateAnyPages, EfiLoaderCode, Pages, &KernelAddr);
         if (EFI_ERROR(status)) {
-            Print(L"FAILED: %r\r\n", status);
+            serial_puts("FAILED\n");
             goto halt;
         }
     }
-    Print(L"OK at 0x%lx\r\n", KernelAddr);
+    serial_puts("OK at ");
+    serial_puthex(KernelAddr);
+    serial_puts("\n");
 
     /* Load kernel into memory */
-    Print(L"Loading kernel into memory... ");
+    serial_puts("Loading kernel into memory... ");
     status = KernelFile->Read(KernelFile, &KernelSize, (VOID *)KernelAddr);
     if (EFI_ERROR(status)) {
-        Print(L"FAILED: %r\r\n", status);
+        serial_puts("FAILED\n");
         goto halt;
     }
-    Print(L"OK\r\n");
+    serial_puts("OK\n");
 
     /* Close file handles */
     KernelFile->Close(KernelFile);
     RootDir->Close(RootDir);
 
-    /* Find device tree - try EFI config table first, fall back to OpenSBI location */
-    Print(L"Looking for device tree... ");
-    VOID *OrigDtb = FindDtb(ST);
-    UINT32 DtbSize = 0;
-    
-    if (OrigDtb) {
-        DtbSize = GetDtbSize(OrigDtb);
-        if (DtbSize > 0) {
-            Print(L"EFI config table at 0x%lx (%d bytes)\r\n", (UINT64)OrigDtb, DtbSize);
-        } else {
-            OrigDtb = NULL;  /* Invalid, try fallback */
-        }
+    /* Find ACPI RSDP */
+    serial_puts("Looking for ACPI RSDP... ");
+    AcpiRsdp = FindAcpiRsdp(SystemTable);
+    if (AcpiRsdp) {
+        serial_puts("OK at ");
+        serial_puthex((UINT64)AcpiRsdp);
+        serial_puts("\n");
+    } else {
+        serial_puts("NOT FOUND\n");
     }
-    
-    /* Fall back to OpenSBI's DTB location */
-    if (!OrigDtb || DtbSize == 0) {
-        OrigDtb = (VOID *)DTB_LOAD_ADDR;
-        DtbSize = GetDtbSize(OrigDtb);
-        if (DtbSize > 0) {
-            Print(L"OpenSBI location at 0x%lx (%d bytes)\r\n", (UINT64)OrigDtb, DtbSize);
-        } else {
-            Print(L"NOT FOUND\r\n");
-            OrigDtb = NULL;
-        }
-    }
-    
-    /* Use the DTB in place (it's already in a good location) */
-    Dtb = OrigDtb;
-
-    /* Get boot hart ID */
-    Print(L"Getting boot hart ID... ");
-    HartId = GetBootHartId(ST);
-    Print(L"OK (hart %d)\r\n", HartId);
 
     /* Get memory map for ExitBootServices */
-    Print(L"\r\nPreparing to exit boot services...\r\n");
+    serial_puts("\nPreparing to exit boot services...\n");
     MemoryMapSize = sizeof(MemoryMapBuffer);
     status = BS->GetMemoryMap(&MemoryMapSize, (EFI_MEMORY_DESCRIPTOR *)MemoryMapBuffer,
                               &MapKey, &DescriptorSize, &DescriptorVersion);
     if (EFI_ERROR(status)) {
-        Print(L"Failed to get memory map: %r\r\n", status);
+        serial_puts("Failed to get memory map\n");
         goto halt;
     }
 
+    /* Prepare boot info structure */
+    BootInfo.magic = BOOT_INFO_MAGIC;
+    BootInfo.mem_map_addr = (UINT64)MemoryMapBuffer;
+    BootInfo.mem_map_size = MemoryMapSize;
+    BootInfo.mem_map_desc_size = DescriptorSize;
+    BootInfo.framebuffer_addr = 0;  /* No framebuffer in text mode */
+    BootInfo.framebuffer_width = 0;
+    BootInfo.framebuffer_height = 0;
+    BootInfo.framebuffer_pitch = 0;
+    BootInfo.acpi_rsdp = (UINT64)AcpiRsdp;
+    BootInfo.num_cpus = 0;  /* Kernel will enumerate via ACPI */
+
     /* Exit boot services */
-    Print(L"Exiting boot services...\r\n");
+    serial_puts("Exiting boot services...\n");
     status = BS->ExitBootServices(ImageHandle, MapKey);
     if (EFI_ERROR(status)) {
         /* Memory map may have changed, try once more */
         MemoryMapSize = sizeof(MemoryMapBuffer);
         BS->GetMemoryMap(&MemoryMapSize, (EFI_MEMORY_DESCRIPTOR *)MemoryMapBuffer,
                          &MapKey, &DescriptorSize, &DescriptorVersion);
+        BootInfo.mem_map_size = MemoryMapSize;
         status = BS->ExitBootServices(ImageHandle, MapKey);
     }
 
     if (EFI_ERROR(status)) {
-        /* Can't print after failed ExitBootServices */
         while (1) {
-            __asm__ volatile("wfi");
+            __asm__ volatile("hlt");
         }
     }
+
+    serial_puts("Jumping to kernel at ");
+    serial_puthex(KernelAddr);
+    serial_puts("...\n\n");
 
     /*
      * Boot services are now terminated!
      * Jump to kernel with:
-     *   a0 = hart id
-     *   a1 = device tree pointer
+     *   RDI = pointer to boot_info
      */
     KernelEntry = (kernel_entry_t)KernelAddr;
-    KernelEntry(HartId, Dtb);
+    KernelEntry(&BootInfo);
 
     /* Should never reach here */
     while (1) {
-        __asm__ volatile("wfi");
+        __asm__ volatile("hlt");
     }
 
 halt:
-    Print(L"\r\nBoot failed. Press any key...\r\n");
-    WaitForSingleEvent(ST->ConIn->WaitForKey, 0);
+    serial_puts("\nBoot failed. System halted.\n");
+    while (1) {
+        __asm__ volatile("hlt");
+    }
     return EFI_LOAD_ERROR;
 }

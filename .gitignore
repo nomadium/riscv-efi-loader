@@ -1,0 +1,6 @@
+*.o
+*.so
+*.elf
+loader.efi
+image/
+ovmf_vars.fd
